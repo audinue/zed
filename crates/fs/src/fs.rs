@@ -53,11 +53,13 @@ use text::LineEnding;
 #[cfg(feature = "test-support")]
 mod fake_git_repo;
 #[cfg(feature = "test-support")]
-use collections::{BTreeMap, btree_map};
+use collections::{BTreeMap, HashMap, btree_map};
 #[cfg(feature = "test-support")]
 pub use fake_git_repo::FakeBlobReadGate;
 #[cfg(feature = "test-support")]
 use fake_git_repo::{FakeCommitDataEntry, FakeGitRepositoryState};
+#[cfg(feature = "test-support")]
+use futures::{FutureExt as _, channel::oneshot, future::Shared};
 #[cfg(feature = "test-support")]
 use git::{
     repository::{CommitData, InitialGraphCommitData, RepoPath, Worktree, repo_path},
@@ -1461,6 +1463,7 @@ struct FakeFsState {
     events_paused: bool,
     buffered_events: Vec<PathEvent>,
     metadata_call_count: usize,
+    metadata_delays: HashMap<PathBuf, Shared<oneshot::Receiver<()>>>,
     read_dir_call_count: usize,
     path_write_counts: std::collections::HashMap<PathBuf, usize>,
     job_event_subscribers: Arc<Mutex<Vec<JobEventSender>>>,
@@ -1857,6 +1860,7 @@ impl FakeFs {
             events_paused: false,
             read_dir_call_count: 0,
             metadata_call_count: 0,
+            metadata_delays: HashMap::default(),
             path_write_counts: Default::default(),
             job_event_subscribers: Arc::new(Mutex::new(Vec::new())),
             trash: Mutex::new(SlotMap::with_key()),
@@ -2807,6 +2811,15 @@ impl FakeFs {
             .unwrap_or(0)
     }
 
+    pub fn pause_metadata(&self, path: &Path) -> oneshot::Sender<()> {
+        let (release, delay) = oneshot::channel();
+        self.state
+            .lock()
+            .metadata_delays
+            .insert(normalize_path(path), delay.shared());
+        release
+    }
+
     pub fn emit_fs_event(&self, path: impl Into<PathBuf>, event: Option<PathEventKind>) {
         self.state.lock().emit_event(std::iter::once((path, event)));
     }
@@ -3339,6 +3352,10 @@ impl Fs for FakeFs {
     async fn metadata(&self, path: &Path) -> Result<Option<Metadata>> {
         self.simulate_random_delay().await;
         let path = normalize_path(path);
+        let delay = self.state.lock().metadata_delays.get(&path).cloned();
+        if let Some(delay) = delay {
+            delay.await.ok();
+        }
         let mut state = self.state.lock();
         state.metadata_call_count += 1;
         if let Some((mut entry, _)) = state.try_entry(&path, false) {

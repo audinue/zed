@@ -1,5 +1,9 @@
 use anyhow::{Context as _, bail};
-use futures::{FutureExt, StreamExt as _, channel::mpsc, future::Shared};
+use futures::{
+    FutureExt, StreamExt as _,
+    channel::{mpsc, oneshot},
+    future::Shared,
+};
 use language::Buffer;
 use remote::RemoteClient;
 use rpc::proto::{self, REMOTE_SERVER_PROJECT_ID};
@@ -19,6 +23,8 @@ use crate::{
 
 pub struct ProjectEnvironment {
     cli_environment: Option<HashMap<String, String>>,
+    pending_environment: Option<Shared<Task<()>>>,
+    weak_self: WeakEntity<Self>,
     local_environments: HashMap<(Shell, Arc<Path>), Shared<Task<Option<HashMap<String, String>>>>>,
     remote_environments: HashMap<(Shell, Arc<Path>), Shared<Task<Option<HashMap<String, String>>>>>,
     environment_error_messages: VecDeque<String>,
@@ -55,6 +61,8 @@ impl ProjectEnvironment {
         });
         Self {
             cli_environment,
+            pending_environment: None,
+            weak_self: cx.weak_entity(),
             local_environments: Default::default(),
             remote_environments: Default::default(),
             environment_error_messages: Default::default(),
@@ -68,12 +76,11 @@ impl ProjectEnvironment {
 
     /// Returns the inherited CLI environment, if this project was opened from the Zed CLI.
     pub(crate) fn get_cli_environment(&self) -> Option<HashMap<String, String>> {
-        if cfg!(any(test, feature = "test-support")) {
-            return Some(HashMap::default());
-        }
         if let Some(mut env) = self.cli_environment.clone() {
             set_origin_marker(&mut env, EnvironmentOrigin::Cli);
             Some(env)
+        } else if cfg!(any(test, feature = "test-support")) {
+            Some(HashMap::default())
         } else {
             None
         }
@@ -85,6 +92,14 @@ impl ProjectEnvironment {
         worktree_store: &Entity<WorktreeStore>,
         cx: &mut Context<Self>,
     ) -> Shared<Task<Option<HashMap<String, String>>>> {
+        if let Some(pending) = self.pending_environment.clone() {
+            let buffer = buffer.clone();
+            let worktree_store = worktree_store.clone();
+            return self.after_environment_resolved(pending, cx, move |environment, cx| {
+                environment.buffer_environment(&buffer, &worktree_store, cx)
+            });
+        }
+
         if let Some(cli_environment) = self.get_cli_environment() {
             log::debug!("using project environment variables from CLI");
             return Task::ready(Some(cli_environment)).shared();
@@ -106,6 +121,12 @@ impl ProjectEnvironment {
         worktree: Entity<Worktree>,
         cx: &mut App,
     ) -> Shared<Task<Option<HashMap<String, String>>>> {
+        if let Some(pending) = self.pending_environment.clone() {
+            return self.after_environment_resolved(pending, cx, move |environment, cx| {
+                environment.worktree_environment(worktree, cx)
+            });
+        }
+
         if let Some(cli_environment) = self.get_cli_environment() {
             log::debug!("using project environment variables from CLI");
             return Task::ready(Some(cli_environment)).shared();
@@ -143,6 +164,12 @@ impl ProjectEnvironment {
         abs_path: Arc<Path>,
         cx: &mut App,
     ) -> Shared<Task<Option<HashMap<String, String>>>> {
+        if let Some(pending) = self.pending_environment.clone() {
+            return self.after_environment_resolved(pending, cx, move |environment, cx| {
+                environment.directory_environment(abs_path, cx)
+            });
+        }
+
         let remote_client = self.remote_client.as_ref().and_then(|it| it.upgrade());
         match remote_client {
             Some(remote_client) => remote_client.clone().read(cx).shell().map(|shell| {
@@ -174,6 +201,12 @@ impl ProjectEnvironment {
         &mut self,
         cx: &mut App,
     ) -> Shared<Task<Option<HashMap<String, String>>>> {
+        if let Some(pending) = self.pending_environment.clone() {
+            return self.after_environment_resolved(pending, cx, |environment, cx| {
+                environment.default_environment(cx)
+            });
+        }
+
         let abs_path = self
             .worktree_store
             .read_with(cx, |worktree_store, cx| {
@@ -198,6 +231,13 @@ impl ProjectEnvironment {
         abs_path: Arc<Path>,
         cx: &mut App,
     ) -> Shared<Task<Option<HashMap<String, String>>>> {
+        if let Some(pending) = self.pending_environment.clone() {
+            let shell = shell.clone();
+            return self.after_environment_resolved(pending, cx, move |environment, cx| {
+                environment.local_directory_environment(&shell, abs_path, cx)
+            });
+        }
+
         if let Some(cli_environment) = self.get_cli_environment() {
             log::debug!("using project environment variables from CLI");
             return Task::ready(Some(cli_environment)).shared();
@@ -256,6 +296,13 @@ impl ProjectEnvironment {
         remote_client: Entity<RemoteClient>,
         cx: &mut App,
     ) -> Shared<Task<Option<HashMap<String, String>>>> {
+        if let Some(pending) = self.pending_environment.clone() {
+            let shell = shell.clone();
+            return self.after_environment_resolved(pending, cx, move |environment, cx| {
+                environment.remote_directory_environment(&shell, abs_path, remote_client, cx)
+            });
+        }
+
         if cfg!(any(test, feature = "test-support")) {
             return Task::ready(Some(HashMap::default())).shared();
         }
@@ -287,6 +334,51 @@ impl ProjectEnvironment {
 
     pub fn pop_environment_error(&mut self) -> Option<String> {
         self.environment_error_messages.pop_front()
+    }
+
+    pub(crate) fn defer_environment(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> (
+        oneshot::Sender<Option<HashMap<String, String>>>,
+        Shared<Task<()>>,
+    ) {
+        debug_assert!(self.pending_environment.is_none());
+        debug_assert!(self.cli_environment.is_none());
+        debug_assert!(self.local_environments.is_empty());
+        debug_assert!(self.remote_environments.is_empty());
+        let (sender, receiver) = oneshot::channel();
+        let completion = cx
+            .spawn(async move |environment, cx| {
+                let cli_environment = receiver.await.unwrap_or_default();
+                environment
+                    .update(cx, |environment, _| {
+                        environment.cli_environment = cli_environment;
+                        environment.pending_environment = None;
+                    })
+                    .ok();
+            })
+            .shared();
+        self.pending_environment = Some(completion.clone());
+        (sender, completion)
+    }
+
+    fn after_environment_resolved(
+        &self,
+        pending: Shared<Task<()>>,
+        cx: &mut App,
+        resolve: impl FnOnce(
+            &mut Self,
+            &mut Context<Self>,
+        ) -> Shared<Task<Option<HashMap<String, String>>>>
+        + 'static,
+    ) -> Shared<Task<Option<HashMap<String, String>>>> {
+        let environment = self.weak_self.clone();
+        cx.spawn(async move |cx| {
+            pending.await;
+            environment.update(cx, resolve).ok()?.await
+        })
+        .shared()
     }
 }
 
@@ -420,4 +512,145 @@ async fn load_direnv_environment(
     }
 
     serde_json::from_str(&output).context("parsing direnv json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worktree_store::WorktreeIdCounter;
+    use fs::FakeFs;
+    use gpui::TestAppContext;
+    use serde_json::json;
+    use settings::SettingsStore;
+    use util::path;
+
+    #[gpui::test]
+    fn test_cli_environment(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        let worktree_store =
+            cx.new(|_| WorktreeStore::local(false, fs, WorktreeIdCounter::default()));
+
+        for (cli_environment, expected) in [
+            (None, HashMap::default()),
+            (
+                Some(HashMap::default()),
+                HashMap::from_iter([("ZED_ENVIRONMENT".to_owned(), "cli".to_owned())]),
+            ),
+            (
+                Some(HashMap::from_iter([
+                    ("CLI_SENTINEL".to_owned(), "value".to_owned()),
+                    ("ZED_ENVIRONMENT".to_owned(), "worktree-shell".to_owned()),
+                ])),
+                HashMap::from_iter([
+                    ("CLI_SENTINEL".to_owned(), "value".to_owned()),
+                    ("ZED_ENVIRONMENT".to_owned(), "cli".to_owned()),
+                ]),
+            ),
+        ] {
+            let environment = cx.new(|cx| {
+                ProjectEnvironment::new(
+                    cli_environment,
+                    worktree_store.downgrade(),
+                    None,
+                    false,
+                    cx,
+                )
+            });
+            assert_eq!(
+                environment.read_with(cx, |environment, _| environment.get_cli_environment()),
+                Some(expected)
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_deferred_cli_environment(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({})).await;
+        let buffer = cx.new(|cx| Buffer::local("", cx));
+        let root = Arc::<Path>::from(Path::new(path!("/project")));
+
+        for (resolution, expected) in [
+            (
+                Some(Some(HashMap::from_iter([(
+                    "CLI_SENTINEL".to_owned(),
+                    "resolved".to_owned(),
+                )]))),
+                HashMap::from_iter([
+                    ("CLI_SENTINEL".to_owned(), "resolved".to_owned()),
+                    ("ZED_ENVIRONMENT".to_owned(), "cli".to_owned()),
+                ]),
+            ),
+            (Some(None), HashMap::default()),
+            (None, HashMap::default()),
+        ] {
+            let worktree_store =
+                cx.new(|_| WorktreeStore::local(false, fs.clone(), WorktreeIdCounter::default()));
+            let environment = cx.new(|cx| {
+                ProjectEnvironment::new(None, worktree_store.downgrade(), None, false, cx)
+            });
+            let (sender, completion) =
+                environment.update(cx, |environment, cx| environment.defer_environment(cx));
+            let directory = environment.update(cx, |environment, cx| {
+                environment.directory_environment(root.clone(), cx)
+            });
+            let worktree = worktree_store
+                .update(cx, |store, cx| {
+                    store.create_worktree(root.as_ref(), true, cx)
+                })
+                .await
+                .unwrap();
+            let requests = environment.update(cx, |environment, cx| {
+                [
+                    directory,
+                    environment.buffer_environment(&buffer, &worktree_store, cx),
+                    environment.worktree_environment(worktree, cx),
+                    environment.default_environment(cx),
+                    environment.local_directory_environment(&Shell::System, root.clone(), cx),
+                ]
+            });
+            cx.run_until_parked();
+            assert_eq!(completion.clone().now_or_never(), None);
+            for request in &requests {
+                assert_eq!(request.clone().now_or_never(), None);
+            }
+            environment.read_with(cx, |environment, _| {
+                assert!(environment.local_environments.is_empty());
+                assert!(environment.remote_environments.is_empty());
+            });
+
+            if let Some(cli_environment) = resolution {
+                sender.send(cli_environment).unwrap();
+            } else {
+                drop(sender);
+            }
+            completion.await;
+            environment.read_with(cx, |environment, _| {
+                assert!(environment.pending_environment.is_none());
+                assert_eq!(environment.get_cli_environment(), Some(expected.clone()));
+            });
+            for request in requests {
+                assert_eq!(request.await, Some(expected.clone()));
+            }
+        }
+
+        let worktree_store =
+            cx.new(|_| WorktreeStore::local(false, fs, WorktreeIdCounter::default()));
+        let environment =
+            cx.new(|cx| ProjectEnvironment::new(None, worktree_store.downgrade(), None, false, cx));
+        let (sender, completion) =
+            environment.update(cx, |environment, cx| environment.defer_environment(cx));
+        let request = environment.update(cx, |environment, cx| environment.default_environment(cx));
+        let weak_environment = environment.downgrade();
+        drop(environment);
+        drop(sender);
+        cx.run_until_parked();
+        completion.await;
+        assert!(weak_environment.upgrade().is_none());
+        assert_eq!(request.await, None);
+    }
 }

@@ -49,7 +49,8 @@ use util::{
     rel_path::RelPath,
 };
 use workspace::{
-    AppState, DismissDecision, ModalView, MultiWorkspace, OpenLog, OpenOptions, Toast, Workspace,
+    AppState, DismissDecision, ModalView, MultiWorkspace, OpenLog, OpenMode, OpenOptions, Toast,
+    Workspace,
     notifications::{DetachAndPromptErr, NotificationId},
     open_remote_project_with_existing_connection,
 };
@@ -503,11 +504,23 @@ impl ProjectPicker {
                     }?;
 
                     let items = open_remote_project_with_existing_connection(
-                        connection, project, paths, app_state, window, None, None, cx,
+                        connection,
+                        project,
+                        paths,
+                        app_state,
+                        window,
+                        None,
+                        None,
+                        if create_new_window {
+                            OpenMode::NewWindow
+                        } else {
+                            OpenMode::Activate
+                        },
+                        cx,
                     )
                     .await
                     .log_err()
-                    .map(|(_workspace, items)| items);
+                    .and_then(|(workspace, items)| workspace.map(|_| items));
 
                     if let Some(items) = items {
                         for (item, path) in items.into_iter().zip(paths_with_positions) {

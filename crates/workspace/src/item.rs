@@ -26,7 +26,7 @@ use smallvec::SmallVec;
 use std::{
     any::{Any, TypeId},
     cell::RefCell,
-    path::Path,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
     time::Duration,
@@ -408,6 +408,14 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
 
 pub trait SerializableItem: Item {
     fn serialized_item_kind() -> &'static str;
+
+    fn serialized_item_paths(
+        _workspace_id: WorkspaceId,
+        _item_id: ItemId,
+        _cx: &mut App,
+    ) -> Task<Result<Vec<PathBuf>>> {
+        Task::ready(Ok(Vec::new()))
+    }
 
     fn cleanup(
         workspace_id: WorkspaceId,

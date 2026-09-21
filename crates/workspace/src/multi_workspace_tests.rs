@@ -642,7 +642,8 @@ async fn test_find_or_create_workspace_uses_project_group_key_when_paths_are_mis
             )
         })
         .await
-        .expect("opening a missing linked-worktree path should fall back to the project group key workspace");
+        .expect("opening a missing linked-worktree path should fall back to the project group key workspace")
+                .expect("opening the workspace should not be cancelled");
 
     assert_eq!(
         workspace.entity_id(),

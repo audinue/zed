@@ -2885,10 +2885,11 @@ mod tests {
     use pretty_assertions::{assert_eq, assert_ne};
     use project::{Project, ProjectPath};
     use prompt_store::PromptBuilder;
-    use remote::RemoteClient;
+    use remote::{MockConnectionOptions, RemoteClient, RemoteConnectionOptions};
     use remote_server::{HeadlessAppState, HeadlessProject};
     use semver::Version;
     use serde_json::json;
+    use session::Session;
     use settings::{SaturatingBool, SettingsStore, SplicingVec, watch_config_file};
     use std::{
         path::{Path, PathBuf},
@@ -6155,6 +6156,9 @@ mod tests {
     ) -> Arc<AppState> {
         cx.update(move |cx| {
             env_logger::builder().is_test(true).try_init().ok();
+            if !cx.has_global::<db::AppDatabase>() {
+                cx.set_global(db::AppDatabase::test_new());
+            }
 
             let state = Arc::get_mut(&mut app_state).unwrap();
             state.build_window_options = build_window_options;
@@ -7814,6 +7818,1006 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_warm_local_open_preserves_dirty_scratch_on_cancel(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        cx.update(recent_projects::init);
+        let project_path = PathBuf::from(path!("/saved-project"));
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(&project_path, json!({}))
+            .await;
+        let saved_window =
+            open_test_project_window_with_tabs(&app_state, &project_path, &[], cx).await;
+        flush_workspace_serialization(&saved_window, cx).await;
+        saved_window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+
+        let scratch_text = "unsaved scratch\n\tλ 🦀\n";
+        let window = open_test_scratch_window(&app_state, scratch_text, cx).await;
+        let scratch = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let session_id = scratch.read_with(cx, |workspace, _| workspace.session_id());
+        for disable_ai in [true, false] {
+            cx.update(|cx| {
+                cx.update_global::<SettingsStore, _>(|store, cx| {
+                    store
+                        .set_user_settings(
+                            &json!({
+                                "disable_ai": disable_ai,
+                                "agent": {"enabled": true},
+                                "default_open_behavior": "existing_window"
+                            })
+                            .to_string(),
+                            cx,
+                        )
+                        .unwrap();
+                });
+            });
+            cx.run_until_parked();
+            window
+                .update(cx, |multi_workspace, window, cx| {
+                    assert_eq!(multi_workspace.multi_workspace_enabled(cx), !disable_ai);
+                    window.activate_window();
+                })
+                .unwrap();
+
+            for recent in [false, true] {
+                if recent {
+                    cx.dispatch_action(*window, zed_actions::OpenRecent::default());
+                    cx.run_until_parked();
+                    window
+                        .update(cx, |_, window, cx| {
+                            let recent_projects = scratch
+                                .read(cx)
+                                .active_modal::<recent_projects::RecentProjects>(cx)
+                                .unwrap();
+                            let picker = recent_projects.read(cx).picker.clone();
+                            picker.update(cx, |picker, cx| {
+                                picker.set_query("saved-project", window, cx);
+                            });
+                        })
+                        .unwrap();
+                    cx.run_until_parked();
+                    cx.dispatch_action(*window, menu::Confirm);
+                } else {
+                    cx.dispatch_action(*window, workspace::Open::default());
+                    cx.run_until_parked();
+                    assert!(cx.did_prompt_for_paths());
+                    cx.simulate_path_prompt_response(|options| {
+                        assert!(options.directories);
+                        Some(vec![project_path.clone()])
+                    });
+                }
+                cx.run_until_parked();
+                assert_eq!(
+                    cx.pending_prompt().map(|(message, _)| message),
+                    Some("This buffer contains unsaved edits. Do you want to save it?".to_string()),
+                    "disable_ai={disable_ai}, recent={recent}"
+                );
+                cx.simulate_prompt_answer("Cancel");
+                cx.run_until_parked();
+                assert!(!cx.has_pending_prompt());
+                assert_eq!(cx.windows().len(), 1);
+                window
+                    .read_with(cx, |multi_workspace, cx| {
+                        assert_eq!(multi_workspace.workspace(), &scratch);
+                        assert_eq!(multi_workspace.workspaces().count(), 1);
+                        let workspace = scratch.read(cx);
+                        assert_eq!(workspace.session_id(), session_id);
+                        assert!(workspace.root_paths(cx).is_empty());
+                        assert_eq!(
+                            workspace_editor_tabs(workspace, cx),
+                            vec![(scratch_text.to_string(), None)]
+                        );
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_startup_focus_request_creates_window_before_accepting_another_open(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        cx.update(init);
+        cx.update(|cx| db::kvp::KeyValueStore::global(cx))
+            .write_kvp(onboarding::FIRST_OPEN.to_string(), "true".to_string())
+            .await
+            .unwrap();
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/project"), json!({"file.txt": "requested text\n"}))
+            .await;
+        let mut startup =
+            crate::StartupRestoration::new(app_state.clone(), &mut cx.to_async()).await;
+        let (ready, ready_for_requests) = futures::channel::oneshot::channel();
+        startup.local_ready = Some(ready);
+        let restoring = cx.spawn({
+            let app_state = app_state.clone();
+            async move |mut cx| {
+                crate::handle_startup_request(
+                    OpenRequest {
+                        kind: Some(OpenRequestKind::FocusApp),
+                        ..OpenRequest::default()
+                    },
+                    startup,
+                    app_state,
+                    &mut cx,
+                )
+                .await
+            }
+        });
+        ready_for_requests.await.unwrap();
+        cx.update(|cx| {
+            crate::handle_open_request(
+                OpenRequest {
+                    open_paths: vec![path!("/project/file.txt").to_string()],
+                    ..OpenRequest::default()
+                },
+                app_state,
+                None,
+                cx,
+            )
+        })
+        .await;
+        restoring.await.unwrap();
+        assert_eq!(cx.windows().len(), 1);
+        cx.windows()[0]
+            .downcast::<MultiWorkspace>()
+            .unwrap()
+            .read_with(cx, |multi_workspace, cx| {
+                let editor = multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .active_item_as::<Editor>(cx)
+                    .unwrap();
+                assert_eq!(editor.read(cx).text(cx), "requested text\n");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_startup_open_request_restores_untitled_buffer(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        cx.update(init);
+
+        let scratch_text = "unsaved scratch\n\tλ 🦀\n";
+        let requested_file = PathBuf::from(path!("/other/b.txt"));
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/other"), json!({ "b.txt": "requested file\n" }))
+            .await;
+
+        let session_id = cx.read(|cx| app_state.session.read(cx).id().to_owned());
+        let window = open_test_scratch_window(&app_state, scratch_text, cx).await;
+        flush_workspace_serialization(&window, cx).await;
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .expect("workspace window was closed");
+        cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 0);
+
+        cx.update(|cx| {
+            app_state.session.update(cx, |app_session, _| {
+                app_session.replace_session_for_test(Session::test_with_old_session(session_id));
+            });
+        });
+
+        let request = OpenRequest {
+            open_paths: vec![requested_file.to_string_lossy().into_owned()],
+            ..OpenRequest::default()
+        };
+        crate::restore_last_session_and_handle_open_request(request, app_state, &mut cx.to_async())
+            .await
+            .expect("failed to handle the startup open request");
+        cx.run_until_parked();
+
+        let windows = cx.read(|cx| {
+            cx.windows()
+                .into_iter()
+                .filter_map(|window| window.downcast::<MultiWorkspace>())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(windows.len(), 1);
+        let tabs = windows[0]
+            .read_with(cx, |multi_workspace, cx| {
+                assert_eq!(multi_workspace.workspaces().count(), 1);
+                workspace_editor_tabs(multi_workspace.workspace().read(cx), cx)
+            })
+            .expect("restored workspace window was closed");
+        assert_eq!(
+            tabs,
+            vec![
+                (scratch_text.to_string(), None),
+                ("requested file\n".to_string(), Some(requested_file)),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_startup_open_request_restores_last_session(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        cx.update(|cx| {
+            cx.set_global(db::AppDatabase::test_new());
+            init(cx);
+        });
+
+        let project_dir = PathBuf::from(path!("/project"));
+        let requested_file = PathBuf::from(path!("/other/b.txt"));
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/"),
+                json!({
+                    "project": { "a.txt": "a" },
+                    "other": { "b.txt": "b" }
+                }),
+            )
+            .await;
+
+        let session_id = cx.read(|cx| app_state.session.read(cx).id().to_owned());
+        let window =
+            open_test_project_window_with_tabs(&app_state, &project_dir, &[rel_path("a.txt")], cx)
+                .await;
+        cx.run_until_parked();
+        flush_workspace_serialization(&window, cx).await;
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .expect("workspace window was closed");
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            app_state.session.update(cx, |app_session, _cx| {
+                app_session
+                    .replace_session_for_test(Session::test_with_old_session(session_id.clone()));
+            });
+        });
+
+        let request = OpenRequest {
+            open_paths: vec![requested_file.to_string_lossy().into_owned()],
+            ..OpenRequest::default()
+        };
+        let mut async_cx = cx.to_async();
+        crate::restore_last_session_and_handle_open_request(
+            request,
+            app_state.clone(),
+            &mut async_cx,
+        )
+        .await
+        .expect("failed to handle the startup open request");
+        cx.run_until_parked();
+
+        let windows = cx.read(|cx| {
+            cx.windows()
+                .into_iter()
+                .filter_map(|window| window.downcast::<MultiWorkspace>())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(windows.len(), 1);
+        let (root_paths, tab_paths) = windows[0]
+            .read_with(cx, |multi_workspace, cx| {
+                let workspace = multi_workspace.workspace().read(cx);
+                let root_paths = workspace
+                    .root_paths(cx)
+                    .into_iter()
+                    .map(|path| path.as_ref().to_path_buf())
+                    .collect::<Vec<_>>();
+                let project = workspace.project().read(cx);
+                let tab_paths = workspace
+                    .active_pane()
+                    .read(cx)
+                    .items()
+                    .map(|item| {
+                        let project_path = item
+                            .project_path(cx)
+                            .expect("tab should have a project path");
+                        project
+                            .absolute_path(&project_path, cx)
+                            .expect("tab should have an absolute path")
+                    })
+                    .collect::<Vec<_>>();
+                (root_paths, tab_paths)
+            })
+            .expect("restored workspace window was closed");
+        assert_eq!(root_paths, vec![project_dir.clone()]);
+        assert_eq!(tab_paths, vec![project_dir.join("a.txt"), requested_file]);
+    }
+
+    #[gpui::test]
+    async fn test_startup_open_request_while_external_tab_is_pending(cx: &mut TestAppContext) {
+        for initial_file_request in [false, true] {
+            for blocked_first in [false, true] {
+                let cx = &mut cx.new_app();
+                let app_state = init_test(cx);
+                cx.update(init);
+                let healthy_root = PathBuf::from(path!("/healthy"));
+                let blocked_root = PathBuf::from(path!("/blocked"));
+                let external_file = PathBuf::from(path!("/external.txt"));
+                let requested_file = healthy_root.join("requested.txt");
+                app_state.fs.as_fake().insert_tree(path!("/"), json!({
+                    "healthy": { "saved.txt": "saved text\n", "requested.txt": "requested text\n" },
+                    "blocked": {},
+                    "external.txt": "external text\n"
+                })).await;
+                let healthy = open_test_project_window_with_tabs(
+                    &app_state,
+                    &healthy_root,
+                    &[rel_path("saved.txt")],
+                    cx,
+                )
+                .await;
+                let blocked =
+                    open_test_project_window_with_tabs(&app_state, &blocked_root, &[], cx).await;
+                blocked
+                    .update(cx, |multi_workspace, window, cx| {
+                        multi_workspace.workspace().update(cx, |workspace, cx| {
+                            workspace.open_abs_path(
+                                external_file.clone(),
+                                OpenOptions::default(),
+                                window,
+                                cx,
+                            )
+                        })
+                    })
+                    .unwrap()
+                    .await
+                    .unwrap();
+                let scratch = blocked
+                    .update(cx, |multi_workspace, window, cx| {
+                        multi_workspace.workspace().update(cx, |workspace, cx| {
+                            Editor::new_in_workspace(workspace, window, cx)
+                        })
+                    })
+                    .unwrap()
+                    .await
+                    .unwrap();
+                scratch.update(cx, |editor, cx| {
+                    editor.edit(
+                        [(
+                            MultiBufferOffset(0)..MultiBufferOffset(0),
+                            "unsaved scratch\n",
+                        )],
+                        cx,
+                    );
+                });
+                drop(scratch);
+                let session_id = cx.read(|cx| app_state.session.read(cx).id().to_owned());
+                for window in [healthy, blocked] {
+                    flush_workspace_serialization(&window, cx).await;
+                    window
+                        .update(cx, |_, window, _| window.remove_window())
+                        .unwrap();
+                }
+                cx.run_until_parked();
+                cx.update(|cx| {
+                    app_state.session.update(cx, |session, _| {
+                        session
+                            .replace_session_for_test(Session::test_with_old_session(session_id));
+                    });
+                });
+                let mut saved = crate::restorable_workspaces(&mut cx.to_async(), &app_state)
+                    .await
+                    .unwrap();
+                assert_eq!(saved.len(), 2);
+                saved.sort_by_key(|workspace| {
+                    let blocked =
+                        workspace.active_workspace.paths.paths() == [blocked_root.clone()];
+                    blocked != blocked_first
+                });
+                let release = app_state.fs.as_fake().pause_metadata(&external_file);
+                let (local_ready, ready) = futures::channel::oneshot::channel();
+                let (finished, mut completion) = futures::channel::oneshot::channel();
+                let request = if initial_file_request {
+                    OpenRequest {
+                        open_paths: vec![requested_file.to_string_lossy().into_owned()],
+                        ..OpenRequest::default()
+                    }
+                } else {
+                    OpenRequest {
+                        kind: Some(OpenRequestKind::FocusApp),
+                        ..OpenRequest::default()
+                    }
+                };
+                let mut startup = cx.spawn({
+                    let app_state = app_state.clone();
+                    async move |mut cx| {
+                        let mut restoration =
+                            crate::StartupRestoration::prepare(saved, app_state.clone(), &mut cx)
+                                .await;
+                        restoration.local_ready = Some(local_ready);
+                        restoration.finished = Some(finished);
+                        crate::handle_startup_request(request, restoration, app_state, &mut cx)
+                            .await
+                    }
+                });
+                cx.run_until_parked();
+                ready
+                    .now_or_never()
+                    .expect("unrelated external tab blocked startup readiness")
+                    .unwrap();
+                assert!(futures::poll!(&mut startup).is_pending());
+                assert!(futures::poll!(&mut completion).is_pending());
+                assert_eq!(cx.windows().len(), 2);
+                if !initial_file_request {
+                    cx.update(|cx| {
+                        crate::handle_open_request(
+                            OpenRequest {
+                                open_paths: vec![requested_file.to_string_lossy().into_owned()],
+                                ..OpenRequest::default()
+                            },
+                            app_state.clone(),
+                            None,
+                            cx,
+                        )
+                    })
+                    .await;
+                }
+                let healthy = cx.read(|cx| cx.active_window()).unwrap();
+                healthy
+                    .downcast::<MultiWorkspace>()
+                    .unwrap()
+                    .read_with(cx, |multi_workspace, cx| {
+                        let workspace = multi_workspace.workspace().read(cx);
+                        assert_eq!(
+                            workspace.root_paths(cx),
+                            vec![Arc::<Path>::from(healthy_root.clone())]
+                        );
+                        assert_eq!(
+                            workspace_editor_tabs(workspace, cx),
+                            vec![
+                                (
+                                    "saved text\n".to_string(),
+                                    Some(healthy_root.join("saved.txt"))
+                                ),
+                                ("requested text\n".to_string(), Some(requested_file)),
+                            ]
+                        );
+                    })
+                    .unwrap();
+                let mut matching = cx.spawn({
+                    let external_file = external_file.clone();
+                    async move |mut cx| {
+                        workspace::find_existing_workspace(
+                            &[external_file],
+                            &OpenOptions::default(),
+                            &workspace::SerializedWorkspaceLocation::Local,
+                            &mut cx,
+                        )
+                        .await
+                        .0
+                    }
+                });
+                cx.run_until_parked();
+                assert!(futures::poll!(&mut matching).is_pending());
+                release.send(()).unwrap();
+                startup.await.unwrap();
+                completion.await.unwrap();
+                let (blocked, _) = matching.await.unwrap();
+                blocked
+                    .read_with(cx, |multi_workspace, cx| {
+                        let workspace = multi_workspace.workspace().read(cx);
+                        assert_eq!(
+                            workspace.root_paths(cx),
+                            vec![Arc::<Path>::from(blocked_root)]
+                        );
+                        assert_eq!(
+                            workspace_editor_tabs(workspace, cx),
+                            vec![
+                                ("external text\n".to_string(), Some(external_file)),
+                                ("unsaved scratch\n".to_string(), None),
+                            ]
+                        );
+                    })
+                    .unwrap();
+                assert_eq!(cx.read(|cx| cx.active_window()), Some(healthy));
+                assert_eq!(cx.windows().len(), 2);
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_closing_window_during_startup_restoration(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        cx.update(init);
+        let external_file = PathBuf::from(path!("/external.txt"));
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/"),
+                json!({
+                    "external.txt": "external text\n"
+                }),
+            )
+            .await;
+        let window = open_test_scratch_window(&app_state, "unsaved scratch\n", cx).await;
+        window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    workspace.open_abs_path(
+                        external_file.clone(),
+                        OpenOptions::default(),
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap()
+            .await
+            .unwrap();
+        let session_id = cx.read(|cx| app_state.session.read(cx).id().to_owned());
+        flush_workspace_serialization(&window, cx).await;
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            app_state.session.update(cx, |session, _| {
+                session.replace_session_for_test(Session::test_with_old_session(session_id));
+            });
+        });
+        let release = app_state.fs.as_fake().pause_metadata(&external_file);
+        let (local_ready, ready) = futures::channel::oneshot::channel();
+        let startup = cx.spawn(async move |mut cx| {
+            let mut restoration = crate::StartupRestoration::new(app_state.clone(), &mut cx).await;
+            restoration.local_ready = Some(local_ready);
+            crate::handle_startup_request(
+                OpenRequest {
+                    kind: Some(OpenRequestKind::FocusApp),
+                    ..OpenRequest::default()
+                },
+                restoration,
+                app_state,
+                &mut cx,
+            )
+            .await
+        });
+        cx.run_until_parked();
+        ready
+            .now_or_never()
+            .expect("startup did not publish its window")
+            .unwrap();
+        assert_eq!(cx.windows().len(), 1);
+        cx.update_window(cx.windows()[0], |_, window, _| window.remove_window())
+            .unwrap();
+        release.send(()).unwrap();
+        startup.await.unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 0);
+    }
+
+    #[gpui::test]
+    async fn test_startup_open_request_opens_file_while_remote_restore_is_pending(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        cx.update(init);
+        let scratch_text = "unsaved scratch\n\tλ 🦀\n";
+        let requested_file = PathBuf::from(path!("/other/b.txt"));
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/other"), json!({ "b.txt": "requested text\n" }))
+            .await;
+        let session_id = cx.read(|cx| app_state.session.read(cx).id().to_owned());
+        let window = open_test_scratch_window(&app_state, scratch_text, cx).await;
+        flush_workspace_serialization(&window, cx).await;
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .expect("workspace window was closed");
+        cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 0);
+        cx.update(|cx| {
+            app_state.session.update(cx, |app_session, _| {
+                app_session.replace_session_for_test(Session::test_with_old_session(session_id));
+            });
+        });
+        let mut multi_workspaces = crate::restorable_workspaces(&mut cx.to_async(), &app_state)
+            .await
+            .expect("saved session should be restorable");
+        assert_eq!(multi_workspaces.len(), 1);
+        let (connection_options, _server_session, connect_guard) =
+            RemoteClient::fake_server(cx, server_cx);
+        let mut remote_workspace = multi_workspaces
+            .first()
+            .expect("saved scratch workspace")
+            .clone();
+        assert!(remote_workspace.active_workspace.paths.is_empty());
+        remote_workspace.active_workspace.location =
+            workspace::SerializedWorkspaceLocation::Remote(connection_options);
+        remote_workspace.active_workspace.paths =
+            workspace::PathList::new(&[PathBuf::from(path!("/remote/project"))]);
+        multi_workspaces.insert(0, remote_workspace);
+
+        let request = OpenRequest {
+            open_paths: vec![requested_file.to_string_lossy().into_owned()],
+            ..OpenRequest::default()
+        };
+        let mut startup = cx.spawn(async move |mut cx| {
+            crate::restore_workspaces_and_handle_open_request(
+                request,
+                multi_workspaces,
+                app_state,
+                &mut cx,
+            )
+            .await
+        });
+        cx.run_until_parked();
+        assert!(futures::poll!(&mut startup).is_pending());
+        assert_eq!(cx.windows().len(), 2);
+        let mut tabs_by_window = cx.read(|cx| {
+            cx.windows()
+                .into_iter()
+                .map(|window| {
+                    window
+                        .downcast::<MultiWorkspace>()
+                        .expect("workspace window")
+                        .read_with(cx, |multi_workspace, cx| {
+                            assert_eq!(multi_workspace.workspaces().count(), 1);
+                            workspace_editor_tabs(multi_workspace.workspace().read(cx), cx)
+                        })
+                        .expect("workspace window was closed")
+                })
+                .collect::<Vec<_>>()
+        });
+        tabs_by_window.sort_by_key(Vec::len);
+        assert_eq!(
+            tabs_by_window,
+            vec![
+                Vec::new(),
+                vec![
+                    (scratch_text.to_string(), None),
+                    ("requested text\n".to_string(), Some(requested_file)),
+                ],
+            ]
+        );
+        drop(startup);
+        cx.run_until_parked();
+        drop(connect_guard);
+    }
+
+    #[gpui::test]
+    async fn test_startup_remote_restoration_foreground_order(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let local_root = path!("/local");
+        let remote_root = path!("/remote");
+        let other_remote_root = path!("/remote-other");
+        let cases: &[(&str, &[&str], &str)] = &[
+            ("focus", &[remote_root], remote_root),
+            ("cli", &[remote_root], remote_root),
+            ("focus", &[local_root, remote_root], remote_root),
+            ("cli", &[local_root, remote_root], remote_root),
+            ("focus", &[remote_root, local_root], local_root),
+            ("cli", &[remote_root, local_root], local_root),
+            ("file", &[local_root, remote_root], local_root),
+            (
+                "cli_then_file",
+                &[remote_root, other_remote_root],
+                local_root,
+            ),
+            (
+                "cli_then_reuse",
+                &[remote_root, other_remote_root],
+                local_root,
+            ),
+        ];
+
+        for &(request_kind, saved_roots, expected_root) in cases {
+            let open_during_restoration =
+                request_kind == "cli_then_file" || request_kind == "cli_then_reuse";
+            let cx = &mut cx.new_app();
+            let server_cx = &mut server_cx.new_app();
+            let app_state = init_test(cx);
+            cx.update(init);
+            let local = saved_test_startup_workspace(&app_state, cx).await;
+            let (connection_options, _server, connect_guard) =
+                startup_test_remote_server(cx, server_cx).await;
+            let remote = saved_test_remote_workspace(connection_options, remote_root, cx).await;
+            let other_server_cx = &mut server_cx.new_app();
+            let (other_connection, _other_server, other_connect_guard) =
+                startup_test_remote_server(cx, other_server_cx).await;
+            let other_remote =
+                saved_test_remote_workspace(other_connection, other_remote_root, cx).await;
+            assert_ne!(
+                local.active_workspace.workspace_id,
+                remote.active_workspace.workspace_id
+            );
+            let saved = saved_roots
+                .iter()
+                .map(|root| {
+                    if *root == local_root {
+                        local.clone()
+                    } else if *root == remote_root {
+                        remote.clone()
+                    } else {
+                        other_remote.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            let (response_sender, mut responses) = mpsc::unbounded();
+            let request = match request_kind {
+                "focus" => OpenRequest {
+                    kind: Some(OpenRequestKind::FocusApp),
+                    ..OpenRequest::default()
+                },
+                "cli" | "cli_then_file" | "cli_then_reuse" => {
+                    let (requests, request_receiver) = mpsc::unbounded();
+                    requests
+                        .unbounded_send(cli::CliRequest::Open {
+                            paths: Vec::new(),
+                            urls: Vec::new(),
+                            diff_paths: Vec::new(),
+                            diff_all: false,
+                            wsl: None,
+                            wait: false,
+                            open_behavior: cli::OpenBehavior::Default,
+                            env: None,
+                            user_data_dir: None,
+                            dev_container: false,
+                            cwd: None,
+                        })
+                        .unwrap();
+                    OpenRequest {
+                        kind: Some(OpenRequestKind::CliConnection((
+                            request_receiver,
+                            Box::new(StartupCliResponseSink(response_sender)),
+                        ))),
+                        ..OpenRequest::default()
+                    }
+                }
+                "file" => OpenRequest {
+                    open_paths: vec![path!("/local/file.txt").to_string()],
+                    ..OpenRequest::default()
+                },
+                _ => unreachable!(),
+            };
+            let (local_ready, ready) = futures::channel::oneshot::channel();
+            let mut restoration =
+                crate::StartupRestoration::prepare(saved, app_state.clone(), &mut cx.to_async())
+                    .await;
+            restoration.local_ready = Some(local_ready);
+            let mut startup = cx.spawn({
+                let app_state = app_state.clone();
+                async move |mut cx| {
+                    crate::handle_startup_request(request, restoration, app_state, &mut cx).await
+                }
+            });
+            cx.run_until_parked();
+            assert!(futures::poll!(&mut startup).is_pending());
+            ready
+                .now_or_never()
+                .expect("startup did not accept new requests")
+                .unwrap();
+            if open_during_restoration {
+                cx.update(|cx| {
+                    crate::handle_open_request(
+                        OpenRequest {
+                            open_paths: vec![
+                                local_root.to_string(),
+                                path!("/local/file.txt").to_string(),
+                            ],
+                            open_behavior: Some(if request_kind == "cli_then_reuse" {
+                                cli::OpenBehavior::ExistingWindow
+                            } else {
+                                cli::OpenBehavior::AlwaysNew
+                            }),
+                            ..OpenRequest::default()
+                        },
+                        app_state.clone(),
+                        None,
+                        cx,
+                    )
+                })
+                .await;
+            }
+            if request_kind == "file" || open_during_restoration {
+                let active = cx.read(|cx| cx.active_window()).unwrap();
+                active
+                    .downcast::<MultiWorkspace>()
+                    .unwrap()
+                    .read_with(cx, |multi_workspace, cx| {
+                        let workspace = multi_workspace.workspace().read(cx);
+                        assert_eq!(
+                            workspace.root_paths(cx),
+                            vec![Arc::<Path>::from(Path::new(local_root))]
+                        );
+                        assert_eq!(
+                            workspace_editor_tabs(workspace, cx),
+                            vec![(
+                                "requested text\n".to_string(),
+                                Some(PathBuf::from(path!("/local/file.txt"))),
+                            )]
+                        );
+                    })
+                    .unwrap();
+            }
+            drop(other_connect_guard);
+            cx.run_until_parked();
+            if open_during_restoration {
+                assert!(futures::poll!(&mut startup).is_pending());
+                assert_eq!(
+                    cx.read(|cx| {
+                        cx.active_window()
+                            .unwrap()
+                            .downcast::<MultiWorkspace>()
+                            .unwrap()
+                            .read_with(cx, |multi_workspace, cx| {
+                                multi_workspace.workspace().read(cx).root_paths(cx)
+                            })
+                            .unwrap()
+                    }),
+                    vec![Arc::<Path>::from(Path::new(local_root))]
+                );
+            }
+            drop(connect_guard);
+            cx.run_until_parked();
+            startup
+                .now_or_never()
+                .expect("remote restoration did not finish")
+                .unwrap();
+            if request_kind == "cli" || open_during_restoration {
+                match responses.next().await.unwrap() {
+                    cli::CliResponse::Exit { status } => assert_eq!(status, 0),
+                    response => panic!("unexpected CLI response: {response:?}"),
+                }
+                assert!(responses.next().await.is_none());
+            }
+            let mut restored_roots = cx.read(|cx| {
+                cx.windows()
+                    .into_iter()
+                    .flat_map(|window| {
+                        window
+                            .downcast::<MultiWorkspace>()
+                            .unwrap()
+                            .read_with(cx, |multi_workspace, cx| {
+                                multi_workspace
+                                    .workspaces()
+                                    .flat_map(|workspace| {
+                                        let workspace = workspace.read(cx);
+                                        let is_remote = workspace.project().read(cx).is_remote();
+                                        workspace.root_paths(cx).into_iter().map(move |root| {
+                                            assert_eq!(
+                                                is_remote,
+                                                root.as_ref() != Path::new(local_root)
+                                            );
+                                            PathBuf::from(root.as_ref())
+                                        })
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            });
+            restored_roots.sort();
+            let mut expected_roots = saved_roots
+                .iter()
+                .map(|root| PathBuf::from(*root))
+                .collect::<Vec<_>>();
+            if open_during_restoration {
+                expected_roots.push(PathBuf::from(local_root));
+            }
+            expected_roots.sort();
+            assert_eq!(restored_roots, expected_roots);
+            let active_roots = cx.read(|cx| {
+                cx.active_window().and_then(|window| {
+                    window
+                        .downcast::<MultiWorkspace>()
+                        .unwrap()
+                        .read_with(cx, |multi_workspace, cx| {
+                            multi_workspace
+                                .workspace()
+                                .read(cx)
+                                .root_paths(cx)
+                                .iter()
+                                .map(|root| PathBuf::from(root.as_ref()))
+                                .collect::<Vec<_>>()
+                        })
+                        .ok()
+                })
+            });
+            assert_eq!(
+                active_roots,
+                Some(vec![PathBuf::from(expected_root)]),
+                "{request_kind}: {saved_roots:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_startup_remote_restoration_does_not_retry_canceled_explicit_target(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        cx.update(init);
+        let (connection_options, _server, connect_guard) =
+            startup_test_remote_server(cx, server_cx).await;
+        drop(connect_guard);
+        let unrelated = saved_test_remote_workspace(connection_options, path!("/remote"), cx).await;
+        let canceled_connection =
+            RemoteConnectionOptions::Mock(MockConnectionOptions { id: u64::MAX });
+        let canceled =
+            saved_test_remote_workspace(canceled_connection.clone(), path!("/canceled:2:3"), cx)
+                .await;
+        let canceled_other =
+            saved_test_remote_workspace(canceled_connection.clone(), path!("/canceled"), cx).await;
+        assert_ne!(
+            unrelated.active_workspace.workspace_id,
+            canceled.active_workspace.workspace_id
+        );
+        let mut startup = cx.spawn(async move |mut cx| {
+            crate::restore_workspaces_and_handle_open_request(
+                OpenRequest {
+                    remote_connection: Some(canceled_connection),
+                    open_paths: vec![path!("/canceled:2:3").to_string()],
+                    ..OpenRequest::default()
+                },
+                vec![unrelated, canceled, canceled_other],
+                app_state,
+                &mut cx,
+            )
+            .await
+        });
+        cx.run_until_parked();
+        assert!(futures::poll!(&mut startup).is_pending());
+        assert_eq!(
+            cx.pending_prompt().map(|(message, _)| message),
+            Some("Failed to connect to mock server".to_string())
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.pending_prompt().map(|(message, _)| message),
+            Some("Failed to connect to mock server".to_string())
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        startup
+            .now_or_never()
+            .expect("canceled target was retried")
+            .unwrap();
+        let restored_remotes = cx.read(|cx| {
+            cx.windows()
+                .into_iter()
+                .filter_map(|window| {
+                    window
+                        .downcast::<MultiWorkspace>()
+                        .unwrap()
+                        .read_with(cx, |multi_workspace, cx| {
+                            let workspace = multi_workspace.workspace().read(cx);
+                            workspace
+                                .project()
+                                .read(cx)
+                                .is_remote()
+                                .then(|| workspace.root_paths(cx))
+                        })
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            restored_remotes,
+            vec![vec![Arc::<Path>::from(Path::new(path!("/remote")))]]
+        );
+        assert_eq!(cx.pending_prompt(), None);
+        assert_eq!(cx.windows().len(), 1);
+    }
+
+    #[gpui::test]
     async fn test_restored_project_groups_survive_workspace_key_change(cx: &mut TestAppContext) {
         use session::Session;
         use util::path_list::PathList;
@@ -8298,6 +9302,163 @@ mod tests {
                 "expected Diagnostics to remain in the View menu"
             );
         });
+    }
+
+    async fn saved_test_startup_workspace(
+        app_state: &Arc<AppState>,
+        cx: &mut TestAppContext,
+    ) -> workspace::SerializedMultiWorkspace {
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/local"), json!({"file.txt": "requested text\n"}))
+            .await;
+        let session_id = cx.read(|cx| app_state.session.read(cx).id().to_owned());
+        let window =
+            open_test_project_window_with_tabs(app_state, Path::new(path!("/local")), &[], cx)
+                .await;
+        flush_workspace_serialization(&window, cx).await;
+        let database = cx.update(|cx| workspace::WorkspaceDb::global(cx));
+        let locations = workspace::last_session_workspace_locations(
+            &database,
+            &session_id,
+            None,
+            app_state.fs.as_ref(),
+        )
+        .await
+        .unwrap();
+        let mut saved = cx.update(|cx| workspace::read_serialized_multi_workspaces(locations, cx));
+        assert_eq!(saved.len(), 1);
+        VisualTestContext::from_window(*window, cx).deactivate_window();
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        saved.pop().unwrap()
+    }
+
+    async fn saved_test_remote_workspace(
+        connection_options: RemoteConnectionOptions,
+        root: &str,
+        cx: &mut TestAppContext,
+    ) -> workspace::SerializedMultiWorkspace {
+        let database = cx.update(|cx| workspace::WorkspaceDb::global(cx));
+        workspace::SerializedMultiWorkspace {
+            active_workspace: workspace::SessionWorkspace {
+                workspace_id: database.next_id().await.unwrap(),
+                location: workspace::SerializedWorkspaceLocation::Remote(connection_options),
+                paths: workspace::PathList::new(&[PathBuf::from(root)]),
+                window_id: None,
+            },
+            state: workspace::MultiWorkspaceState::default(),
+        }
+    }
+
+    async fn startup_test_remote_server(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) -> (
+        RemoteConnectionOptions,
+        Entity<HeadlessProject>,
+        futures::channel::oneshot::Sender<()>,
+    ) {
+        server_cx.update(|cx| {
+            release_channel::init(Version::new(0, 0, 0), cx);
+            HeadlessProject::init(cx);
+        });
+        let (connection_options, session, connect_guard) = RemoteClient::fake_server(cx, server_cx);
+        let fs = FakeFs::new(server_cx.executor());
+        fs.insert_tree(path!("/"), json!({"remote": {}, "remote-other": {}}))
+            .await;
+        let server = server_cx.new(|cx| {
+            HeadlessProject::new(
+                HeadlessAppState {
+                    session,
+                    fs,
+                    http_client: Arc::new(BlockedHttpClient),
+                    node_runtime: NodeRuntime::unavailable(),
+                    languages: Arc::new(LanguageRegistry::new(cx.background_executor().clone())),
+                    extension_host_proxy: Arc::new(ExtensionHostProxy::new()),
+                    startup_time: std::time::Instant::now(),
+                },
+                false,
+                cx,
+            )
+        });
+        (connection_options, server, connect_guard)
+    }
+
+    struct StartupCliResponseSink(mpsc::UnboundedSender<cli::CliResponse>);
+
+    impl cli::CliResponseSink for StartupCliResponseSink {
+        fn send(&self, response: cli::CliResponse) -> anyhow::Result<()> {
+            self.0.unbounded_send(response).map_err(anyhow::Error::from)
+        }
+    }
+
+    async fn open_test_scratch_window(
+        app_state: &Arc<AppState>,
+        scratch_text: &str,
+        cx: &mut TestAppContext,
+    ) -> WindowHandle<MultiWorkspace> {
+        let workspace::OpenResult { window, .. } = cx
+            .update(|cx| {
+                Workspace::new_local(
+                    Vec::new(),
+                    app_state.clone(),
+                    None,
+                    None,
+                    None,
+                    workspace::OpenMode::Activate,
+                    cx,
+                )
+            })
+            .await
+            .expect("failed to open empty workspace");
+        let editor = window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    assert_eq!(workspace.project().read(cx).worktrees(cx).count(), 0);
+                    Editor::new_in_workspace(workspace, window, cx)
+                })
+            })
+            .expect("workspace window was closed")
+            .await
+            .expect("failed to create scratch editor");
+        editor.update(cx, |editor, cx| {
+            editor.edit(
+                [(MultiBufferOffset(0)..MultiBufferOffset(0), scratch_text)],
+                cx,
+            );
+            assert!(editor.is_dirty(cx));
+        });
+        window
+    }
+
+    fn workspace_editor_tabs(workspace: &Workspace, cx: &App) -> Vec<(String, Option<PathBuf>)> {
+        workspace
+            .active_pane()
+            .read(cx)
+            .items()
+            .map(|item| {
+                let editor = item.downcast::<Editor>().expect("tab should be an editor");
+                let editor = editor.read(cx);
+                let buffer = editor
+                    .buffer()
+                    .read(cx)
+                    .as_singleton()
+                    .expect("editor should have one buffer");
+                let file_path = buffer.read(cx).file().map(|file| {
+                    file.as_local()
+                        .expect("requested file should be local")
+                        .abs_path(cx)
+                });
+                if file_path.is_none() {
+                    assert!(editor.is_dirty(cx));
+                }
+                (editor.text(cx), file_path)
+            })
+            .collect()
     }
 
     fn has_view_item(cx: &mut App, item_name: &str) -> bool {

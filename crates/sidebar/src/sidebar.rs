@@ -1309,7 +1309,6 @@ impl Sidebar {
         let host = project_group_key.host();
         let provisional_key = Some(project_group_key.clone());
         let active_workspace = multi_workspace.read(cx).workspace().clone();
-        let modal_workspace = active_workspace.clone();
 
         let task = multi_workspace.update(cx, |this, cx| {
             this.find_or_create_workspace(
@@ -1325,13 +1324,7 @@ impl Sidebar {
             )
         });
 
-        cx.spawn_in(window, async move |_this, cx| {
-            let result = task.await;
-            remote_connection::dismiss_connection_modal(&modal_workspace, cx);
-            result?;
-            anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
+        task.detach_and_log_err(cx);
     }
 
     fn open_workspace_and_create_entry(
@@ -1365,7 +1358,9 @@ impl Sidebar {
         });
 
         cx.spawn_in(window, async move |this, cx| {
-            let workspace = task.await?;
+            let Some(workspace) = task.await? else {
+                return Ok(());
+            };
             this.update_in(cx, |this, window, cx| match target {
                 NewEntryTarget::LastCreatedKind => this.create_new_entry(&workspace, window, cx),
                 NewEntryTarget::Terminal => this.create_new_terminal(&workspace, window, cx),
@@ -4086,7 +4081,6 @@ impl Sidebar {
         let host = project_group_key.host();
         let provisional_key = Some(project_group_key.clone());
         let active_workspace = multi_workspace.read(cx).workspace().clone();
-        let modal_workspace = active_workspace.clone();
 
         let open_task = multi_workspace.update(cx, |this, cx| {
             this.find_or_create_workspace(
@@ -4104,11 +4098,8 @@ impl Sidebar {
 
         cx.spawn_in(window, async move |this, cx| {
             let result = open_task.await;
-            // Dismiss the modal as soon as the open attempt completes so
-            // failures or cancellations do not leave a stale connection modal behind.
-            remote_connection::dismiss_connection_modal(&modal_workspace, cx);
 
-            if result.is_err() {
+            if !matches!(result, Ok(Some(_))) {
                 this.update(cx, |this, _cx| {
                     if this.pending_thread_activation == Some(pending_thread_id) {
                         this.pending_thread_activation = None;
@@ -4117,7 +4108,9 @@ impl Sidebar {
                 .ok();
             }
 
-            let workspace = result?;
+            let Some(workspace) = result? else {
+                return Ok(());
+            };
             this.update_in(cx, |this, window, cx| {
                 this.activate_thread(metadata, &workspace, false, window, cx);
             })?;
@@ -4719,7 +4712,6 @@ impl Sidebar {
         let host = project_group_key.host();
         let provisional_key = Some(project_group_key.clone());
         let active_workspace = multi_workspace.read(cx).workspace().clone();
-        let modal_workspace = active_workspace.clone();
 
         let open_task = multi_workspace.update(cx, |this, cx| {
             this.find_or_create_workspace(
@@ -4736,9 +4728,9 @@ impl Sidebar {
         });
 
         cx.spawn_in(window, async move |this, cx| {
-            let result = open_task.await;
-            remote_connection::dismiss_connection_modal(&modal_workspace, cx);
-            let workspace = result?;
+            let Some(workspace) = open_task.await? else {
+                return Ok(());
+            };
             this.update_in(cx, |this, window, cx| {
                 this.activate_terminal_in_workspace(&workspace, metadata, false, window, cx);
             })?;
@@ -5034,7 +5026,6 @@ impl Sidebar {
 
         let host = project_group_key.host();
         let active_workspace = multi_workspace.read(cx).workspace().clone();
-        let modal_workspace = active_workspace.clone();
 
         let open_task = multi_workspace.update(cx, |this, cx| {
             this.find_or_create_workspace(
@@ -5051,9 +5042,9 @@ impl Sidebar {
         });
 
         cx.spawn_in(window, async move |this, cx| {
-            let result = open_task.await;
-            remote_connection::dismiss_connection_modal(&modal_workspace, cx);
-            let workspace = result?;
+            let Some(workspace) = open_task.await? else {
+                return Ok(());
+            };
             Self::wait_for_archive_workspace_metadata(&workspace, cx).await;
 
             this.update_in(cx, |this, window, cx| then(this, workspace, window, cx))?;

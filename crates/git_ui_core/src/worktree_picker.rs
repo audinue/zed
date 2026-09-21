@@ -18,7 +18,7 @@ use ui::{
 };
 use util::{ResultExt as _, paths::PathExt};
 use workspace::{
-    ModalView, MultiWorkspace, RemovalIntent, Workspace, dock::DockPosition,
+    ModalView, MultiWorkspace, OpenMode, RemovalIntent, Workspace, dock::DockPosition,
     notifications::DetachAndPromptErr,
 };
 
@@ -1649,6 +1649,7 @@ pub async fn open_remote_worktree(
         new_window,
         None,
         None,
+        OpenMode::NewWindow,
         cx,
     )
     .await?;

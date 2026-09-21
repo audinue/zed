@@ -1,7 +1,10 @@
 mod image_info;
 mod image_viewer_settings;
 
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::Context as _;
 use editor::{
@@ -683,6 +686,19 @@ fn breadcrumbs_text_for_image(project: &Project, image: &ImageItem, cx: &App) ->
 impl SerializableItem for ImageView {
     fn serialized_item_kind() -> &'static str {
         "ImageView"
+    }
+
+    fn serialized_item_paths(
+        workspace_id: WorkspaceId,
+        item_id: ItemId,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Vec<PathBuf>>> {
+        Task::ready(
+            ImageViewerDb::global(cx)
+                .get_image_path(item_id, workspace_id)
+                .and_then(|path| path.context("No image path found"))
+                .map(|path| vec![path]),
+        )
     }
 
     fn deserialize(

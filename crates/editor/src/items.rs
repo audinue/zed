@@ -1263,6 +1263,26 @@ impl SerializableItem for Editor {
         "Editor"
     }
 
+    fn serialized_item_paths(
+        workspace_id: WorkspaceId,
+        item_id: ItemId,
+        cx: &mut App,
+    ) -> Task<Result<Vec<PathBuf>>> {
+        Task::ready(
+            EditorDb::global(cx)
+                .get_serialized_editor_path(item_id, workspace_id)
+                .context("Failed to query editor path")
+                .and_then(|path| {
+                    path.with_context(|| {
+                        format!(
+                            "No editor entry for item_id: {item_id} and workspace_id {workspace_id:?}"
+                        )
+                    })
+                })
+                .map(|path| path.into_iter().collect()),
+        )
+    }
+
     fn cleanup(
         workspace_id: WorkspaceId,
         alive_items: Vec<ItemId>,
@@ -2827,6 +2847,42 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    #[gpui::test]
+    async fn test_serialized_item_paths(cx: &mut gpui::TestAppContext) {
+        let db = cx.update(|cx| workspace::WorkspaceDb::global(cx));
+        let workspace_id = db.next_id().await.unwrap();
+        let other_workspace_id = db.next_id().await.unwrap();
+        let editor_db = cx.update(|cx| EditorDb::global(cx));
+        let path = PathBuf::from(path!("/outside/λ file.txt"));
+
+        for (abs_path, expected) in [(Some(path.clone()), vec![path]), (None, Vec::new())] {
+            editor_db
+                .save_serialized_editor(
+                    1,
+                    workspace_id,
+                    SerializedEditor {
+                        abs_path,
+                        contents: Some("unsaved text".to_owned()),
+                        ..SerializedEditor::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let paths = cx
+                .update(|cx| Editor::serialized_item_paths(workspace_id, 1, cx))
+                .await
+                .unwrap();
+            assert_eq!(paths, expected);
+        }
+
+        assert!(
+            cx.update(|cx| Editor::serialized_item_paths(other_workspace_id, 1, cx))
+                .await
+                .is_err()
+        );
+        assert!(cx.windows().is_empty());
     }
 
     #[gpui::test]

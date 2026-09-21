@@ -568,40 +568,31 @@ pub fn connect_with_modal(
     }
 
     workspace.update(cx, |workspace, cx| {
+        let mut modal = None;
         workspace.toggle_modal(window, cx, |window, cx| {
+            modal = Some(cx.entity());
             RemoteConnectionModal::new(&connection_options, Vec::new(), window, cx)
         });
-        let Some(modal) = workspace.active_modal::<RemoteConnectionModal>(cx) else {
+        let Some(modal) = modal else {
             return Task::ready(Err(anyhow::anyhow!(
                 "Failed to open remote connection dialog"
             )));
         };
         let prompt = modal.read(cx).prompt.clone();
-        connect(
+        let connect = connect(
             ConnectionIdentifier::setup(),
             connection_options,
             prompt,
             window,
             cx,
-        )
-    })
-}
-
-/// Dismisses any active [`RemoteConnectionModal`] on the given workspace.
-///
-/// This should be called after a remote connection attempt completes
-/// (success or failure) when the modal was shown on a workspace that may
-/// outlive the connection flow — for example, when the modal is shown
-/// on a local workspace before switching to a newly-created remote
-/// workspace.
-pub fn dismiss_connection_modal(workspace: &Entity<Workspace>, cx: &mut gpui::AsyncWindowContext) {
-    workspace
-        .update_in(cx, |workspace, _window, cx| {
-            if let Some(modal) = workspace.active_modal::<RemoteConnectionModal>(cx) {
-                modal.update(cx, |modal, cx| modal.finished(cx));
-            }
+        );
+        let modal = modal.downgrade();
+        cx.spawn(async move |_, cx| {
+            let result = connect.await;
+            modal.update(cx, |modal, cx| modal.finished(cx)).ok();
+            result
         })
-        .ok();
+    })
 }
 
 /// Creates a [`RemoteClient`] by reusing an existing connection from the

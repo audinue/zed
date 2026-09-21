@@ -234,6 +234,17 @@ db::static_connection!(EditorDb, [WorkspaceDb]);
 const MAX_QUERY_PLACEHOLDERS: usize = 32000;
 
 impl EditorDb {
+    pub fn get_serialized_editor_path(
+        &self,
+        item_id: ItemId,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<Option<PathBuf>>> {
+        let mut query = self.select_row_bound::<_, Option<PathBuf>>(sql!(
+            SELECT path FROM editors WHERE item_id = ? AND workspace_id = ?
+        ))?;
+        query((item_id, workspace_id))
+    }
+
     query! {
         pub fn get_serialized_editor(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<SerializedEditor>> {
             SELECT path, buffer_path, contents, language, mtime_seconds, mtime_nanos FROM editors

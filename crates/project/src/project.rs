@@ -78,8 +78,11 @@ pub use environment::ProjectEnvironment;
 
 use futures::{
     StreamExt,
-    channel::mpsc::{self, UnboundedReceiver},
-    future::try_join_all,
+    channel::{
+        mpsc::{self, UnboundedReceiver},
+        oneshot,
+    },
+    future::{Shared, try_join_all},
 };
 pub use image_store::{ImageItem, ImageStore};
 use image_store::{ImageItemEvent, ImageStoreEvent};
@@ -2292,6 +2295,17 @@ impl Project {
     #[inline]
     pub fn environment(&self) -> &Entity<ProjectEnvironment> {
         &self.environment
+    }
+
+    pub fn defer_environment(
+        &self,
+        cx: &mut App,
+    ) -> (
+        oneshot::Sender<Option<HashMap<String, String>>>,
+        Shared<Task<()>>,
+    ) {
+        self.environment
+            .update(cx, |environment, cx| environment.defer_environment(cx))
     }
 
     #[inline]

@@ -15808,7 +15808,8 @@ async fn test_find_or_create_workspace_returns_the_created_remote_workspace(
             )
         })
         .await
-        .expect("opening the remote project should succeed");
+        .expect("opening the remote project should succeed")
+        .expect("opening the remote project should not be cancelled");
     cx.run_until_parked();
 
     assert_eq!(

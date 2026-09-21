@@ -390,8 +390,10 @@ impl SerializedPane {
             items.push(item_handle.clone());
 
             if let Some(item_handle) = item_handle {
+                let focus_item =
+                    workspace.read_with(cx, |workspace, _| workspace.owns_window_chrome())?;
                 pane.update_in(cx, |pane, window, cx| {
-                    pane.add_item(item_handle.clone(), true, true, None, window, cx);
+                    pane.add_item(item_handle.clone(), true, focus_item, None, window, cx);
                 })?;
             }
         }

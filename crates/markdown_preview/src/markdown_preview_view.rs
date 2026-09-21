@@ -2059,6 +2059,19 @@ impl SerializableItem for MarkdownPreviewView {
         "MarkdownPreviewView"
     }
 
+    fn serialized_item_paths(
+        workspace_id: WorkspaceId,
+        item_id: ItemId,
+        cx: &mut App,
+    ) -> Task<Result<Vec<PathBuf>>> {
+        Task::ready(
+            persistence::MarkdownPreviewDb::global(cx)
+                .get_preview(item_id, workspace_id)
+                .and_then(|preview| preview.context("No markdown preview entry found"))
+                .map(|(path, _)| vec![path]),
+        )
+    }
+
     fn deserialize(
         project: Entity<Project>,
         workspace: WeakEntity<Workspace>,

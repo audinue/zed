@@ -1105,14 +1105,39 @@ impl MultiWorkspace {
         source_workspace: Option<WeakEntity<Workspace>>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Task<Result<Entity<Workspace>>> {
+    ) -> Task<Result<Option<Entity<Workspace>>>> {
         if let Some(workspace) = self.workspace_for_paths(&paths, host.as_ref(), cx) {
+            if host.is_some() {
+                if open_mode == OpenMode::Add {
+                    self.add(workspace.clone(), window, cx);
+                    return Task::ready(Ok(Some(workspace)));
+                }
+                let window_handle = window.window_handle().downcast::<MultiWorkspace>();
+                return cx.spawn(async move |_, cx| {
+                    let window_handle = window_handle.context("Window is not a MultiWorkspace")?;
+                    crate::with_remote_workspace_replacement(
+                        window_handle,
+                        Some(&workspace),
+                        cx,
+                        |multi_workspace, window, cx| {
+                            multi_workspace.activate(
+                                workspace.clone(),
+                                source_workspace,
+                                window,
+                                cx,
+                            );
+                            workspace.clone()
+                        },
+                    )
+                    .await
+                });
+            }
             self.activate(workspace.clone(), source_workspace, window, cx);
-            return Task::ready(Ok(workspace));
+            return Task::ready(Ok(Some(workspace)));
         }
 
         let Some(connection_options) = host else {
-            return self.find_or_create_local_workspace(
+            let task = self.find_or_create_local_workspace(
                 paths,
                 provisional_project_group_key,
                 init,
@@ -1121,6 +1146,7 @@ impl MultiWorkspace {
                 window,
                 cx,
             );
+            return cx.background_spawn(async move { task.await.map(Some) });
         };
 
         let app_state = self.workspace().read(cx).app_state().clone();
@@ -1129,9 +1155,9 @@ impl MultiWorkspace {
         let paths_vec = paths.paths().to_vec();
 
         cx.spawn(async move |_this, cx| {
-            let session = connect_task
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("Remote connection was cancelled"))?;
+            let Some(session) = connect_task.await? else {
+                return Ok(None);
+            };
 
             let new_project = cx.update(|cx| {
                 Project::remote(
@@ -1176,7 +1202,7 @@ impl MultiWorkspace {
             let window_handle =
                 window_handle.ok_or_else(|| anyhow::anyhow!("Window is not a MultiWorkspace"))?;
 
-            let (workspace, _items) = open_remote_project_with_existing_connection(
+            let (Some(workspace), _items) = open_remote_project_with_existing_connection(
                 connection_options,
                 new_project,
                 effective_paths_vec,
@@ -1184,13 +1210,17 @@ impl MultiWorkspace {
                 window_handle,
                 provisional_project_group_key,
                 source_workspace,
+                open_mode,
                 cx,
             )
-            .await?;
+            .await?
+            else {
+                return Ok(None);
+            };
 
             window_handle.update(cx, |multi_workspace, window, cx| {
                 multi_workspace.add(workspace.clone(), window, cx);
-                workspace
+                Some(workspace)
             })
         })
     }
@@ -1403,7 +1433,11 @@ impl MultiWorkspace {
     /// Detaches a workspace: clears session state, DB binding, cached
     /// group key, and emits `WorkspaceRemoved`. The DB row is preserved
     /// so the workspace still appears in the recent-projects list.
-    fn detach_workspace(&mut self, workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
+    pub(crate) fn detach_workspace(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(index) = self.held_index(workspace) {
             assert_ne!(
                 index,

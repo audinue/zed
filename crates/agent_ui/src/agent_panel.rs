@@ -4908,7 +4908,8 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
                 })?;
                 let created = creation
                     .await
-                    .context("failed to create worktree workspace")?;
+                    .context("failed to create worktree workspace")?
+                    .context("Worktree workspace opening was cancelled")?;
                 // The creation flow tells us when the project had multiple
                 // worktrees of the same underlying repo, which it consolidates
                 // into one new worktree — flag it so the calling agent knows
